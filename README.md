@@ -123,11 +123,17 @@ bench/                reproducible harnesses: corpus, qa, stress, mcp probe
 tests/                59 tests, no network or GPU needed
 ```
 
-## Credit
+## Prior art
 
-Process and design-system guidance adapted from **unslop** by Damir Sokolovsky
-([@heydamir](https://x.com/heydamir)), CC BY 4.0. Token-architecture ideas from
-`pingdotgg/t3code` (MIT). Prior art for repo maps: aider's tree-sitter + PageRank
-approach.
+The repo-map technique — extract declarations with tree-sitter, build a file
+dependency graph, rank it with PageRank, truncate to a token budget — comes from
+[aider](https://aider.chat/2023/10/22/repomap). This project follows the same
+four steps and adds what that approach lacks: per-file parse confidence, budget
+enforcement that reports its own truncation, and an accuracy benchmark with
+independent oracles.
+
+Nothing else was used. The engine, the benchmarks, and the tool layer are
+original, and every number in this README was measured by the harnesses in
+`bench/` rather than estimated.
 
 MIT.
