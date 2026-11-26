@@ -183,12 +183,70 @@ export function shellQuote(s: string): string {
  * text names the fallback tool, because "sightline is unavailable" alone leaves the
  * model stuck.
  */
+/**
+ * Turn an exec failure into something the model can act on.
+ *
+ * Measured failure: a whole session ran with every sightline call returning
+ * `sightline: command not found` (exit 127). The tools were registered and
+ * "working" — the binary was not on PATH. An agent cannot diagnose that from a
+ * raw shell string, so the failure kinds are named explicitly here.
+ */
+export function explainExecFailure(
+  exitCode: number,
+  output: string,
+  binName: string,
+): { kind: string; message: string; remedy: string } {
+  const out = output.trim();
+
+  if (exitCode === 127) {
+    return {
+      kind: "not_installed",
+      message: `${binName} is not installed in this sandbox (exit 127).`,
+      remedy:
+        `Install it once with: pip install -e <path-to-sightline>\n` +
+        `Or set CODEMAP_PYTHONPATH to a checkout and use ` +
+        `python3 -m sightline. Until then, use the built-in tools.`,
+    };
+  }
+
+  if (/no such file or directory/i.test(out) && /python3|node/i.test(out)) {
+    return {
+      kind: "runtime_missing",
+      message: `The interpreter for ${binName} is missing (${out}).`,
+      remedy: "Install Python 3.10+ in the sandbox image, then retry.",
+    };
+  }
+
+  if (/no index|run .* index/i.test(out)) {
+    return {
+      kind: "no_index",
+      message: "No index exists for this workspace yet.",
+      remedy: `Run: ${binName} index\n(the first call builds it; later calls are fast)`,
+    };
+  }
+
+  if (exitCode === 124 || /timed out/i.test(out)) {
+    return {
+      kind: "timeout",
+      message: `${binName} timed out.`,
+      remedy:
+        "Narrow the request: pass a smaller path, a lower budget, or a focus area.",
+    };
+  }
+
+  return {
+    kind: "failed",
+    message: out || `${binName} exited ${exitCode} with no output.`,
+    remedy: "Fall back to the built-in equivalent tool.",
+  };
+}
+
 export async function runInWorkspace(
   sandbox: SandboxLike,
   resolve: PathResolver,
   requestedPath: string | undefined,
   command: (safeRelativePath: string) => string,
-  opts: { fallback?: string; timeoutMs?: number } = {},
+  opts: { fallback?: string; timeoutMs?: number; binName?: string } = {},
 ): Promise<ToolResult> {
   const requested = requestedPath ?? ".";
   const abs = resolve(requested, sandbox.workingDirectory);
@@ -212,15 +270,22 @@ export async function runInWorkspace(
     const out = `${r.stdout ?? ""}${r.stderr ? `\n${r.stderr}` : ""}`.trim();
 
     if ((r.exitCode ?? 0) !== 0 && !r.stdout) {
-      return fail(
-        out || `command exited ${r.exitCode} with no output`,
-        opts.fallback,
+      const why = explainExecFailure(
+        r.exitCode ?? 1,
+        out,
+        opts.binName ?? "sightline",
       );
+      return fail(`[${why.kind}] ${why.message}`, why.remedy);
     }
     return ok(out);
   } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/ENOENT|not found/i.test(msg)) {
+      const why = explainExecFailure(127, msg, opts.binName ?? "sightline");
+      return fail(`[${why.kind}] ${why.message}`, why.remedy);
+    }
     return fail(
-      `command failed: ${e instanceof Error ? e.message : String(e)}`,
+      `command failed: ${msg}`,
       opts.fallback ?? "fall back to the built-in equivalent",
     );
   }

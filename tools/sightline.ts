@@ -1,5 +1,6 @@
 import { tool } from "ai";
 import { z } from "zod";
+import { type ToolResult, ok, fail, clampToBudget } from "./core";
 import * as path from "path";
 import { getSandbox, toDisplayPath } from "./utils";
 import { resolveWorkspacePath } from "./path-security";
@@ -71,6 +72,34 @@ async function runSightline(
   }
 }
 
+/**
+ * Run a command, building the index first if it is missing.
+ *
+ * Without this the agent must know to run `sightline index` as a separate step,
+ * and the first thing it sees is an error. Measured: a registered tool returning
+ * "no index" on every call is indistinguishable from a broken tool.
+ */
+async function runSightlineReady(
+  sandbox: Awaited<ReturnType<typeof getSandbox>>,
+  args: string[],
+): Promise<{ ok: true; out: string } | { ok: false; error: string }> {
+  const first = await runSightline(sandbox, args);
+  if (first.ok) return first;
+  if (!/no index|run .*index/i.test(first.error)) return first;
+
+  const built = await runSightline(sandbox, ["index"]);
+  if (!built.ok) {
+    return {
+      ok: false,
+      error:
+        "sightline could not build an index for this workspace. " +
+        built.error +
+        " Fall back to dir_list and grep.",
+    };
+  }
+  return runSightline(sandbox, args);
+}
+
 function shellQuote(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
 }
@@ -99,12 +128,7 @@ const sightlineMapInputSchema = z.object({
 
 export type SightlineMapInput = z.infer<typeof sightlineMapInputSchema>;
 
-export interface SightlineMapResult {
-  success: boolean;
-  map?: string;
-  truncated?: boolean;
-  error?: string;
-}
+export type SightlineMapResult = ToolResult<{ truncated?: boolean; budget?: number }>;
 
 export const sightlineMapTool = () =>
   tool({
@@ -129,33 +153,29 @@ Budget 2000 to start. If output says "showing directories", pass focus.`,
       try {
         sandbox = await getSandbox(experimental_context, "sightline_map");
       } catch (error) {
-        return {
-          success: false,
-          error: `Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}). Cannot build a map.`,
-        };
+        return fail(
+          `Sandbox unavailable: ${error instanceof Error ? error.message : String(error)}.`,
+          "use dir_list and grep",
+        );
       }
 
       if (focus) {
         const abs = resolveWorkspacePath(focus, sandbox.workingDirectory);
         if (!abs) {
-          return {
-            success: false,
-            error: `Focus '${focus}' is outside the workspace directory.`,
-          };
+          return fail(`Focus '${focus}' is outside the workspace directory.`);
         }
       }
 
       const args = ["map", "--budget", String(budget)];
       if (focus) args.push("--focus", toDisplayPath(resolveWorkspacePath(focus, sandbox.workingDirectory)!, sandbox.workingDirectory) || focus);
 
-      const r = await runSightline(sandbox, args);
-      if (!r.ok) return { success: false, error: r.error };
+      const r = await runSightlineReady(sandbox, args);
+      if (!r.ok) return fail(r.error);
 
-      return {
-        success: true,
-        map: r.out.trimEnd(),
+      return ok(clampToBudget(r.out, budget), {
         truncated: r.out.includes("omitted by budget") || r.out.includes("narrow:"),
-      };
+        budget,
+      });
     },
   });
 
@@ -186,12 +206,7 @@ const sightlineListInputSchema = z.object({
 
 export type SightlineListInput = z.infer<typeof sightlineListInputSchema>;
 
-export interface SightlineListResult {
-  success: boolean;
-  listing?: string;
-  truncated?: boolean;
-  error?: string;
-}
+export type SightlineListResult = ToolResult<{ truncated?: boolean; path?: string }>;
 
 export const sightlineListTool = () =>
   tool({
@@ -215,32 +230,25 @@ Lists every non-binary file, including configs and dotfiles. symbols:false is 4x
       try {
         sandbox = await getSandbox(experimental_context, "sightline_list");
       } catch (error) {
-        return {
-          success: false,
-          error: `Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}). Cannot list.`,
-        };
+        return fail(`Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}). Cannot list.`);
       }
 
       const abs = resolveWorkspacePath(requested, sandbox.workingDirectory);
       if (!abs) {
-        return {
-          success: false,
-          error: `Path '${requested}' is outside the workspace directory.`,
-        };
+        return fail(`Path '${requested}' is outside the workspace directory.`);
       }
 
       const display = toDisplayPath(abs, sandbox.workingDirectory) || ".";
       const args = ["list", display, "--budget", String(budget), "--direct"];
       if (!symbols) args.push("--no-symbols");
 
-      const r = await runSightline(sandbox, args);
-      if (!r.ok) return { success: false, error: r.error };
+      const r = await runSightlineReady(sandbox, args);
+      if (!r.ok) return fail(r.error);
 
-      return {
-        success: true,
-        listing: r.out.trimEnd(),
+      return ok(clampToBudget(r.out, budget), {
         truncated: r.out.includes("narrow:"),
-      };
+        path: display,
+      });
     },
   });
 
@@ -254,11 +262,7 @@ const sightlineFileInputSchema = z.object({
 
 export type SightlineFileInput = z.infer<typeof sightlineFileInputSchema>;
 
-export interface SightlineFileResult {
-  success: boolean;
-  outline?: string;
-  error?: string;
-}
+export type SightlineFileResult = ToolResult<{ path?: string; confidence?: string }>;
 
 export const sightlineFileTool = () =>
   tool({
@@ -282,34 +286,26 @@ WHEN NOT TO USE:
       try {
         sandbox = await getSandbox(experimental_context, "sightline_file");
       } catch (error) {
-        return {
-          success: false,
-          error: `Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}).`,
-        };
+        return fail(`Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}).`);
       }
 
       const abs = resolveWorkspacePath(requested, sandbox.workingDirectory);
       if (!abs) {
-        return {
-          success: false,
-          error: `Path '${requested}' is outside the workspace directory.`,
-        };
+        return fail(`Path '${requested}' is outside the workspace directory.`);
       }
 
       const display = toDisplayPath(abs, sandbox.workingDirectory) || requested;
-      const r = await runSightline(sandbox, ["file", display]);
-      if (!r.ok) return { success: false, error: r.error };
+      const r = await runSightlineReady(sandbox, ["file", display]);
+      if (!r.ok) return fail(r.error);
 
       if (r.out.includes("not in index")) {
-        return {
-          success: false,
-          error:
-            `'${display}' is not in the index. It may be binary, generated, or ` +
-            "outside the indexed set. Use read instead.",
-        };
+        return fail(
+          `'${display}' is not in the index (binary, generated, or excluded).`,
+          "use read instead",
+        );
       }
 
-      return { success: true, outline: r.out.trimEnd() };
+      return ok(r.out, { path: display });
     },
   });
 
@@ -332,12 +328,7 @@ const sightlineFindInputSchema = z.object({
 
 export type SightlineFindInput = z.infer<typeof sightlineFindInputSchema>;
 
-export interface SightlineFindResult {
-  success: boolean;
-  matches?: string;
-  count?: number;
-  error?: string;
-}
+export type SightlineFindResult = ToolResult<{ count?: number; query?: string }>;
 
 export const sightlineFindTool = () =>
   tool({
@@ -362,21 +353,14 @@ One result per definition, ordered by importance.`,
       try {
         sandbox = await getSandbox(experimental_context, "sightline_find");
       } catch (error) {
-        return {
-          success: false,
-          error: `Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}).`,
-        };
+        return fail(`Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}).`);
       }
 
-      const r = await runSightline(sandbox, ["find", query, "--limit", String(limit)]);
-      if (!r.ok) return { success: false, error: r.error };
+      const r = await runSightlineReady(sandbox, ["find", query, "--limit", String(limit)]);
+      if (!r.ok) return fail(r.error);
 
       const lines = r.out.trim().split("\n").filter(Boolean);
-      return {
-        success: true,
-        matches: r.out.trimEnd(),
-        count: lines.length,
-      };
+      return ok(r.out, { count: lines.length, query });
     },
   });
 
@@ -395,11 +379,7 @@ const sightlineCallersInputSchema = z.object({
 
 export type SightlineCallersInput = z.infer<typeof sightlineCallersInputSchema>;
 
-export interface SightlineCallersResult {
-  success: boolean;
-  report?: string;
-  error?: string;
-}
+export type SightlineCallersResult = ToolResult<{ symbol?: string }>;
 
 export const sightlineCallersTool = () =>
   tool({
@@ -423,19 +403,16 @@ Replaces a grep plus a read per hit.`,
       try {
         sandbox = await getSandbox(experimental_context, "sightline_callers");
       } catch (error) {
-        return {
-          success: false,
-          error: `Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}).`,
-        };
+        return fail(`Sandbox is unavailable (${error instanceof Error ? error.message : String(error)}).`);
       }
 
-      const r = await runSightline(sandbox, [
+      const r = await runSightlineReady(sandbox, [
         "callers",
         symbol,
         "--limit",
         String(limit),
       ]);
-      if (!r.ok) return { success: false, error: r.error };
-      return { success: true, report: r.out.trimEnd() };
+      if (!r.ok) return fail(r.error);
+      return ok(r.out, { symbol });
     },
   });
